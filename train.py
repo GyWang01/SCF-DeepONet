@@ -1,0 +1,318 @@
+import os
+import torch
+import torch.nn as nn
+import torch.optim as optim
+from torch.utils.data import DataLoader
+from torch.amp import autocast, GradScaler
+import numpy as np
+import time
+import h5py
+import random
+
+from dataset import EMT_SCF_Dataset
+from networks import SCFDeepONet_V1
+
+
+def seed_everything(seed=42):
+    random.seed(seed)
+    os.environ['PYTHONHASHSEED'] = str(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    torch.cuda.manual_seed(seed)
+    torch.cuda.manual_seed_all(seed)
+    torch.backends.cudnn.deterministic = False
+    torch.backends.cudnn.benchmark = True
+
+
+def worker_init_fn(worker_id):
+    worker_seed = torch.initial_seed() % 2 ** 32
+    np.random.seed(worker_seed)
+    random.seed(worker_seed)
+
+
+class HeatmapLoss(nn.Module):
+    def __init__(self, dice_weight=0.5):
+        super().__init__()
+        self.bce_logits = nn.BCEWithLogitsLoss()
+        self.dice_weight = dice_weight
+
+    def forward(self, logits, probs, target):
+        bce_loss = self.bce_logits(logits, target)
+        smooth = 1e-6
+        intersection = (probs * target).sum()
+        dice_loss = 1.0 - (2. * intersection + smooth) / (probs.sum() + target.sum() + smooth)
+        return bce_loss + self.dice_weight * dice_loss
+
+
+def calculate_iou(pred_prob, target_mask, threshold=0.5):
+    pred_bin = (pred_prob > threshold).float()
+    target_bin = (target_mask > 0.5).float()
+    intersection = (pred_bin * target_bin).sum().item()
+    union = (pred_bin + target_bin).sum().item() - intersection
+    if union == 0: return 1.0
+    return intersection / union
+
+
+def create_val_grid(device, resolution=128):
+    lin = torch.linspace(-1.0, 1.0, resolution, device=device)
+    Y, X = torch.meshgrid(lin, lin, indexing='ij')
+    grid_2d = torch.stack([X, Y], dim=-1).view(-1, 2)
+    return grid_2d
+
+
+def get_grid_target(label_norm, grid_2d):
+    cx, cy, w, l = label_norm.tolist()
+    x_min, x_max = cx - w / 2, cx + w / 2
+    y_min, y_max = cy - l / 2, cy + l / 2
+    in_x = (grid_2d[:, 0] >= x_min) & (grid_2d[:, 0] <= x_max)
+    in_y = (grid_2d[:, 1] >= y_min) & (grid_2d[:, 1] <= y_max)
+    return (in_x & in_y).float().unsqueeze(1)
+
+
+# 【核心修改】传入 epoch 信息，处理专家要求的 Warmup 策略
+def train_epoch(model, dataloader, optimizer, scaler, heat_loss_fn, mse_loss_fn, mode, device, amp_enabled, epoch,
+                epochs_stage1):
+    model.train()
+    total_heat_loss, total_A_loss = 0.0, 0.0
+
+    for batch in dataloader:
+        v_pair = batch["v_pair"].to(device)
+        coords_2d = batch["coords_2d"].to(device)
+        heat_target = batch["heat_target"].to(device)
+
+        optimizer.zero_grad(set_to_none=True)
+
+        with autocast('cuda', enabled=amp_enabled):
+            branch_out = model.encode_observation(v_pair)
+            heat_out = model.query_heatmap(branch_out, coords_2d)
+            loss_heat = heat_loss_fn(heat_out["heat_logits"], heat_out["heat_prob"], heat_target)
+
+            if mode == "heat_only":
+                loss = loss_heat
+            elif mode == "joint":
+                coords_3d = batch["coords_3d"].to(device)
+                excite_idx = batch["excite_idx"].to(device)
+                A_target = batch["A_target"].to(device)
+
+                field_out = model.query_field(branch_out, coords_3d, excite_idx)
+                loss_A = mse_loss_fn(field_out["A_delta_norm"], A_target)
+
+                # 【顶层战略 3】Stage 2 前 8 轮对 A_MSE 施加 0.5 倍 Warmup，防止带崩热图
+                weight_A = 0.5 if (epoch - epochs_stage1) <= 8 else 1.0
+                loss = (1.0 / 16.0) * loss_heat + weight_A * loss_A
+                total_A_loss += loss_A.item()
+
+        scaler.scale(loss).backward()
+        scaler.unscale_(optimizer)
+        torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+        scaler.step(optimizer)
+        scaler.update()
+
+        total_heat_loss += loss_heat.item()
+
+    num_batches = len(dataloader)
+    return total_heat_loss / num_batches, total_A_loss / num_batches if mode == "joint" else 0.0
+
+
+@torch.no_grad()
+# 【核心修改】引入 skip_A_val 参数，控制沉重的 3D 验证频率
+def validate(model, dataloader, heat_loss_fn, mse_loss_fn, mode, device, val_grid, amp_enabled, skip_A_val):
+    model.eval()
+    total_heat_loss, total_A_loss = 0.0, 0.0
+    total_iou, total_rmse = 0.0, 0.0
+    val_physical_count = 0
+
+    for batch in dataloader:
+        v_pair = batch["v_pair"].to(device)
+        excite_idx = batch["excite_idx"].to(device)
+
+        with autocast('cuda', enabled=amp_enabled):
+            branch_out = model.encode_observation(v_pair)
+
+            B = v_pair.shape[0]
+            for b in range(B):
+                if excite_idx[b].item() == 0:
+                    val_physical_count += 1
+                    single_branch = {k: v[b:b + 1] for k, v in branch_out.items()}
+                    grid_input = val_grid.unsqueeze(0)
+
+                    heat_out = model.query_heatmap(single_branch, grid_input)
+                    pred_logits = heat_out["heat_logits"][0]
+                    pred_prob = heat_out["heat_prob"][0]
+
+                    label_norm = batch["label_xywl"][b]
+                    target_mask = get_grid_target(label_norm, val_grid).to(device)
+
+                    total_heat_loss += heat_loss_fn(pred_logits, pred_prob, target_mask).item()
+                    total_iou += calculate_iou(pred_prob, target_mask)
+
+            # 【顶层战略】如果 skip_A_val=True，这一步直接跳过，节省海量验证时间
+            if mode == "joint" and not skip_A_val:
+                coords_3d = batch["coords_3d"].to(device)
+                A_target = batch["A_target"].to(device)
+
+                field_out = model.query_field(branch_out, coords_3d, excite_idx)
+                mse = mse_loss_fn(field_out["A_delta_norm"], A_target)
+
+                total_A_loss += mse.item()
+                total_rmse += torch.sqrt(mse).item()
+
+    num_batches = len(dataloader)
+    va_heat = total_heat_loss / val_physical_count if val_physical_count > 0 else 0.0
+    va_iou = total_iou / val_physical_count if val_physical_count > 0 else 0.0
+
+    if mode == "joint" and not skip_A_val:
+        va_A = total_A_loss / num_batches
+        va_rmse = total_rmse / num_batches
+    else:
+        va_A, va_rmse = 0.0, 0.0
+
+    return va_heat, va_A, va_iou, va_rmse
+
+
+# 【核心修改】接受细粒度的分离参数传入
+def get_dataloaders(h5_path, train_ids, val_ids, mode, batch_size, p2_train, p3_train, p2_val, p3_val, excite_train,
+                    excite_val):
+    print(
+        f"\n🔄 装载 {mode.upper()} 管道 | BS={batch_size} | P3(Tr/Va)={p3_train}/{p3_val} | Excite(Tr/Va)={excite_train}/{excite_val}")
+
+    train_dataset = EMT_SCF_Dataset(h5_path, sample_indices=train_ids, split="train", mode=mode,
+                                    num_p2_points=p2_train, num_p3_points=p3_train, excite_per_sample=excite_train)
+    val_dataset = EMT_SCF_Dataset(h5_path, sample_indices=val_ids, split="val", mode=mode,
+                                  num_p2_points=p2_val, num_p3_points=p3_val, excite_per_sample=excite_val)
+
+    train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True, num_workers=4, pin_memory=True,
+                              persistent_workers=True, worker_init_fn=worker_init_fn)
+    val_loader = DataLoader(val_dataset, batch_size=batch_size, shuffle=False, num_workers=4, pin_memory=True,
+                            worker_init_fn=worker_init_fn)
+    return train_loader, val_loader
+
+
+def main():
+    print("🚀 启动 SCF-DeepONet 究极性能版训练引擎...")
+    seed_everything(42)
+
+    ckpt_dir, splits_dir = "checkpoints", "splits"
+    os.makedirs(ckpt_dir, exist_ok=True);
+    os.makedirs(splits_dir, exist_ok=True)
+
+    device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
+    amp_enabled = (device.type == "cuda")
+    print(f"🖥️  运行设备: {device} | 混合精度(AMP): {amp_enabled}")
+
+    h5_path = 'EMT_SCF_Dataset.h5'
+    with h5py.File(h5_path, 'r') as hf:
+        total_physical_samples = hf['v_pair'].shape[0]
+
+    assert total_physical_samples == 1000, f"⚠️ 警告：期望 1000 个样本，但实际有 {total_physical_samples} 个！"
+
+    all_ids = np.arange(total_physical_samples)
+    np.random.shuffle(all_ids)
+    train_ids = all_ids[:850]
+    val_ids = all_ids[850:]
+    np.save(os.path.join(splits_dir, "train_ids.npy"), train_ids)
+    np.save(os.path.join(splits_dir, "val_ids.npy"), val_ids)
+
+    # ================= 专家最强推荐参数表 (全方位减负) =================
+    epochs_stage1, epochs_stage2 = 20, 150
+    total_epochs = epochs_stage1 + epochs_stage2
+
+    # Stage 1: 猛加 Batch，不碰 3D
+    bs_stage1 = 24
+    p2_train_s1, p3_train_s1 = 2000, 100
+    p2_val_s1, p3_val_s1 = 256, 100
+    excite_train_s1, excite_val_s1 = 16, 16
+
+    # Stage 2: 核心 3D 训练，断崖式减负 (Train 视角切到 4，Val 的 P3 降到 2000)
+    bs_stage2 = 8
+    p2_train_s2, p3_train_s2 = 2000, 6000
+    p2_val_s2, p3_val_s2 = 256, 2000
+    excite_train_s2, excite_val_s2 = 4, 16
+    # =================================================================
+
+    train_loader, val_loader = get_dataloaders(
+        h5_path, train_ids, val_ids, mode="heat_only", batch_size=bs_stage1,
+        p2_train=p2_train_s1, p3_train=p3_train_s1, p2_val=p2_val_s1, p3_val=p3_val_s1,
+        excite_train=excite_train_s1, excite_val=excite_val_s1
+    )
+    val_grid = create_val_grid(device, resolution=128)
+
+    model = SCFDeepONet_V1().to(device)
+    heat_loss_fn = HeatmapLoss(dice_weight=0.5)
+    mse_loss_fn = nn.MSELoss()
+
+    init_lr = 3e-4
+    optimizer = optim.AdamW(model.parameters(), lr=init_lr, weight_decay=1e-5)
+    scheduler = optim.lr_scheduler.ReduceLROnPlateau(optimizer, mode='min', factor=0.5, patience=5)
+    scaler = GradScaler('cuda', enabled=amp_enabled)
+
+    best_val_loss = float('inf')
+    last_va_A, last_va_rmse = 0.0, 0.0  # 用于轮询跳过验证时的缓存
+
+    print("\n================ 开始课表训练 (Curriculum Training) ================")
+    for epoch in range(1, total_epochs + 1):
+        start_time = time.time()
+        mode = "heat_only" if epoch <= epochs_stage1 else "joint"
+
+        if epoch == epochs_stage1 + 1:
+            print("\n🌟 触发进化！进入 Stage 2: 2D & 3D 联合训练阶段 (Joint Mode) 🌟")
+            best_heat_ckpt = os.path.join(ckpt_dir, "best_stage1_heat.pth")
+            if os.path.exists(best_heat_ckpt):
+                print("⏳ 正在回滚至 Stage 1 巅峰权重...")
+                model.load_state_dict(torch.load(best_heat_ckpt, map_location=device)['model_state_dict'])
+                print("✅ 权重回滚成功！")
+
+            best_val_loss = float('inf')
+            for param_group in optimizer.param_groups: param_group['lr'] = init_lr
+            scheduler = optim.lr_scheduler.ReduceLROnPlateau(optimizer, mode='min', factor=0.5, patience=5)
+
+            del train_loader, val_loader
+            train_loader, val_loader = get_dataloaders(
+                h5_path, train_ids, val_ids, mode="joint", batch_size=bs_stage2,
+                p2_train=p2_train_s2, p3_train=p3_train_s2, p2_val=p2_val_s2, p3_val=p3_val_s2,
+                excite_train=excite_train_s2, excite_val=excite_val_s2
+            )
+            print(f"🔄 3D 降维管线已接通，起飞！\n")
+
+        tr_heat, tr_A = train_epoch(model, train_loader, optimizer, scaler, heat_loss_fn, mse_loss_fn, mode, device,
+                                    amp_enabled, epoch, epochs_stage1)
+
+        # 【顶层战略】每逢单数 Epoch 跳过沉重的 3D 验证，节省时间
+        skip_A_val = (mode == "joint") and (epoch % 2 != 0)
+        va_heat, va_A_curr, va_iou, va_rmse_curr = validate(model, val_loader, heat_loss_fn, mse_loss_fn, mode, device,
+                                                            val_grid, amp_enabled, skip_A_val)
+
+        if not skip_A_val:
+            last_va_A, last_va_rmse = va_A_curr, va_rmse_curr
+
+        val_total_loss = va_heat if mode == "heat_only" else (1.0 / 16.0) * va_heat + last_va_A
+        scheduler.step(val_total_loss)
+        current_lr = optimizer.param_groups[0]['lr']
+
+        epoch_time = time.time() - start_time
+        skip_mark = " (Skipped)" if skip_A_val else ""
+        print(
+            f"Epoch [{epoch:03d}/{total_epochs:03d}] | Mode: {mode.upper():9s} | LR: {current_lr:.2e} | Time: {epoch_time:.1f}s")
+        print(f"  [Train] Heat Loss: {tr_heat:.4f} | A_MSE Loss: {tr_A:.4e}")
+        print(f"  [Val]   Heat Loss: {va_heat:.4f} | Heat IoU:   {va_iou * 100:05.2f}%")
+        if mode == "joint":
+            print(f"  [Val]   A_MSE:     {last_va_A:.4e}{skip_mark} | A_RMSE:     {last_va_rmse:.4e}{skip_mark}")
+
+        checkpoint = {
+            'epoch': epoch, 'model_state_dict': model.state_dict(),
+            'optimizer_state_dict': optimizer.state_dict(),
+            'scheduler_state_dict': scheduler.state_dict(),
+            'scaler_state_dict': scaler.state_dict(),
+            'val_loss': val_total_loss, 'mode': mode
+        }
+        torch.save(checkpoint, os.path.join(ckpt_dir, "latest_model.pth"))
+
+        if val_total_loss < best_val_loss and not skip_A_val:
+            best_val_loss = val_total_loss
+            save_name = "best_stage1_heat.pth" if mode == "heat_only" else "best_stage2_joint.pth"
+            print(f"  🚀 新纪录诞生！保存为 {save_name} (Loss: {best_val_loss:.4e})")
+            torch.save(checkpoint, os.path.join(ckpt_dir, save_name))
+
+
+if __name__ == '__main__':
+    main()
