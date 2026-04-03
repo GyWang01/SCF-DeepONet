@@ -2,7 +2,7 @@ import os
 import torch
 import torch.nn as nn
 import torch.optim as optim
-from torch.utils.data import DataLoader, Sampler
+from torch.utils.data import DataLoader
 from torch.amp import autocast, GradScaler
 import numpy as np
 import time
@@ -28,22 +28,6 @@ def worker_init_fn(worker_id):
     worker_seed = torch.initial_seed() % 2 ** 32
     np.random.seed(worker_seed)
     random.seed(worker_seed)
-
-
-class PhysicalWeightedSampler(Sampler):
-    def __init__(self, weights, num_samples, excite_per_sample):
-        self.weights = torch.as_tensor(weights, dtype=torch.double)
-        self.num_samples = num_samples
-        self.excite_per_sample = excite_per_sample
-
-    def __iter__(self):
-        drawn_samples = torch.multinomial(self.weights, self.num_samples, replacement=True)
-        for sample_idx in drawn_samples:
-            for i in range(self.excite_per_sample):
-                yield int(sample_idx * self.excite_per_sample + i)
-
-    def __len__(self):
-        return self.num_samples * self.excite_per_sample
 
 
 class HeatmapLoss(nn.Module):
@@ -85,9 +69,18 @@ def get_grid_target(label_norm, grid_2d):
     return (in_x & in_y).float().unsqueeze(1)
 
 
+# =========================================================================
+# 🚀 专家绝杀策略：真正的“只校准热图输出层”
+# =========================================================================
 def freeze_all_for_stage3(model):
+    """
+    外科手术级冻结：封死所有共享表征，防止灾难性遗忘！
+    """
+    # 1) 先将全网 100% 绝对冻结
     for p in model.parameters():
         p.requires_grad = False
+
+    # 2) 只打开热图的最终输出头 (咱们之前为了 AMP 稳定，把它命名为了 heat_logits_head)
     for p in model.heatmap_trunk.heat_logits_head.parameters():
         p.requires_grad = True
 
@@ -193,31 +186,24 @@ def validate(model, dataloader, heat_loss_fn, mse_loss_fn, mode, device, val_gri
 
 
 def get_dataloaders(h5_path, train_ids, val_ids, mode, batch_size, p2_train, p3_train, p2_val, p3_val, excite_train,
-                    excite_val, use_weighted_sampler=False):
+                    excite_val):
     print(
-        f"\n🔄 装载 {mode.upper()} 管道 | BS={batch_size} | P3={p3_train}/{p3_val} | Excite={excite_train}/{excite_val} | Weighted={use_weighted_sampler}")
+        f"\n🔄 装载 {mode.upper()} 管道 | BS={batch_size} | P3={p3_train}/{p3_val} | Excite={excite_train}/{excite_val}")
 
     train_dataset = EMT_SCF_Dataset(h5_path, sample_indices=train_ids, split="train", mode=mode,
                                     num_p2_points=p2_train, num_p3_points=p3_train, excite_per_sample=excite_train)
     val_dataset = EMT_SCF_Dataset(h5_path, sample_indices=val_ids, split="val", mode=mode,
                                   num_p2_points=p2_val, num_p3_points=p3_val, excite_per_sample=excite_val)
 
-    if use_weighted_sampler:
-        train_weights = train_dataset.get_physical_weights()
-        sampler = PhysicalWeightedSampler(train_weights, train_dataset.num_samples, train_dataset.excite_per_sample)
-        train_loader = DataLoader(train_dataset, batch_size=batch_size, sampler=sampler, num_workers=4, pin_memory=True,
-                                  persistent_workers=False, worker_init_fn=worker_init_fn)
-    else:
-        train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True, num_workers=4, pin_memory=True,
-                                  persistent_workers=False, worker_init_fn=worker_init_fn)
-
+    train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True, num_workers=4, pin_memory=True,
+                              persistent_workers=True, worker_init_fn=worker_init_fn)
     val_loader = DataLoader(val_dataset, batch_size=batch_size, shuffle=False, num_workers=4, pin_memory=True,
-                            persistent_workers=False, worker_init_fn=worker_init_fn)
+                            worker_init_fn=worker_init_fn)
     return train_loader, val_loader
 
 
 def main():
-    print("🚀 启动 SCF-DeepONet 究极性能版 (物理级重构 V1.5 + 专家级课表)...")
+    print("🚀 启动 SCF-DeepONet 究极性能版训练引擎 (真·热图精修版本)...")
     seed_everything(42)
 
     ckpt_dir, splits_dir = "checkpoints", "splits"
@@ -238,28 +224,26 @@ def main():
     np.save(os.path.join(splits_dir, "train_ids.npy"), train_ids)
     np.save(os.path.join(splits_dir, "val_ids.npy"), val_ids)
 
-    # 🚀 黄金课表：100 + 80 + 5
-    epochs_stage1 = 100
+    epochs_stage1 = 20
     epochs_stage2 = 80
+    # 🚀 【缩短课表】只调校最终概率决策层，5个Epoch就足够摸清底细了
     epochs_stage3 = 5
     total_epochs = epochs_stage1 + epochs_stage2 + epochs_stage3
 
     bs_stage1 = 24
     p2_train_s1, p3_train_s1 = 2000, 100
     p2_val_s1, p3_val_s1 = 256, 100
-    excite_train_s1, excite_val_s1 = 1, 1
+    excite_train_s1, excite_val_s1 = 16, 16
 
     bs_stage2 = 8
     p2_train_s2, p3_train_s2 = 2000, 6000
     p2_val_s2, p3_val_s2 = 256, 2000
     excite_train_s2, excite_val_s2 = 4, 16
 
-    # Stage 1 强制关闭加权，还原纯净的地基分布
     train_loader, val_loader = get_dataloaders(
         h5_path, train_ids, val_ids, mode="heat_only", batch_size=bs_stage1,
         p2_train=p2_train_s1, p3_train=p3_train_s1, p2_val=p2_val_s1, p3_val=p3_val_s1,
-        excite_train=excite_train_s1, excite_val=excite_val_s1,
-        use_weighted_sampler=False
+        excite_train=excite_train_s1, excite_val=excite_val_s1
     )
     val_grid = create_val_grid(device, resolution=128)
 
@@ -269,14 +253,13 @@ def main():
 
     init_lr = 3e-4
     optimizer = optim.AdamW(model.parameters(), lr=init_lr, weight_decay=1e-5)
-    scheduler = optim.lr_scheduler.ReduceLROnPlateau(optimizer, mode='min', factor=0.5, patience=10)
+    scheduler = optim.lr_scheduler.ReduceLROnPlateau(optimizer, mode='min', factor=0.5, patience=6)
     scaler = GradScaler('cuda', enabled=amp_enabled)
 
     best_val_loss = float('inf')
-    best_iou_stage1 = 0.0
     best_iou_stage2 = 0.0
     best_rmse_stage2 = float('inf')
-    best_iou_stage3 = 0.0
+    best_val_loss_stage3 = float('inf')
 
     last_va_A, last_va_rmse = 0.0, 0.0
 
@@ -290,45 +273,44 @@ def main():
         # ================== 阶段 2：联合训练 ==================
         if epoch == epochs_stage1 + 1:
             print("\n🌟 触发进化！进入 Stage 2: 2D & 3D 联合训练阶段 🌟")
-            # 🚀 强制加载 Stage 1 定位最准的权重 (最佳 IoU)
-            best_heat_ckpt = os.path.join(ckpt_dir, "best_stage1_iou.pth")
+            best_heat_ckpt = os.path.join(ckpt_dir, "best_stage1_heat.pth")
             if os.path.exists(best_heat_ckpt):
                 model.load_state_dict(torch.load(best_heat_ckpt, map_location=device)['model_state_dict'])
-                print("✅ 权重回滚成功 (已加载 Stage 1 最佳 IoU 权重)！")
+                print("✅ 权重回滚成功！")
 
             best_val_loss = float('inf')
             for param_group in optimizer.param_groups: param_group['lr'] = init_lr
             scheduler = optim.lr_scheduler.ReduceLROnPlateau(optimizer, mode='min', factor=0.5, patience=6)
 
             del train_loader, val_loader
-            # Stage 2 开启困难样本温和加权
             train_loader, val_loader = get_dataloaders(
                 h5_path, train_ids, val_ids, mode="joint", batch_size=bs_stage2,
                 p2_train=p2_train_s2, p3_train=p3_train_s2, p2_val=p2_val_s2, p3_val=p3_val_s2,
-                excite_train=excite_train_s2, excite_val=excite_val_s2,
-                use_weighted_sampler=True
+                excite_train=excite_train_s2, excite_val=excite_val_s2
             )
 
         # ================== 阶段 3：真正的热图精修 ==================
         if epoch == epochs_stage1 + epochs_stage2 + 1:
-            print("\n🔥 终极冲刺！进入 Stage 3: Heatmap Polish (无 Scheduler 冻结版) 🔥")
+            print("\n🔥 终极冲刺！进入 Stage 3: Heatmap Polish (绝对冻结防崩坏版) 🔥")
             best_iou_ckpt = os.path.join(ckpt_dir, "best_stage2_iou.pth")
             if os.path.exists(best_iou_ckpt):
                 model.load_state_dict(torch.load(best_iou_ckpt, map_location=device)['model_state_dict'])
                 print(f"✅ 成功加载 Stage 2 最佳 IoU 权重进行精修！")
 
+            # 🚀 【核心整改 1】执行外科手术级冻结，护住所有共享表征
             freeze_all_for_stage3(model)
 
+            # 🚀 【核心整改 2】彻底重置优化器，丢弃历史动量包袱！
             trainable_params = [p for p in model.parameters() if p.requires_grad]
             optimizer = optim.AdamW(trainable_params, lr=3e-5, weight_decay=1e-5)
+            # 重置对应的 scheduler
+            scheduler = optim.lr_scheduler.ReduceLROnPlateau(optimizer, mode='min', factor=0.5, patience=3)
 
             del train_loader, val_loader
-            # Stage 3 恢复纯自然分布
             train_loader, val_loader = get_dataloaders(
                 h5_path, train_ids, val_ids, mode="heat_only", batch_size=bs_stage1,
                 p2_train=p2_train_s1, p3_train=p3_train_s1, p2_val=p2_val_s1, p3_val=p3_val_s1,
-                excite_train=excite_train_s1, excite_val=excite_val_s1,
-                use_weighted_sampler=False
+                excite_train=excite_train_s1, excite_val=excite_val_s1
             )
 
         tr_heat, tr_A = train_epoch(model, train_loader, optimizer, scaler, heat_loss_fn, mse_loss_fn, mode, device,
@@ -343,7 +325,7 @@ def main():
 
         val_total_loss = va_heat if (mode == "heat_only" or is_stage3) else (1.0 / 16.0) * va_heat + last_va_A
 
-        if not skip_A_val and not is_stage3:
+        if not skip_A_val:
             scheduler.step(val_total_loss)
 
         current_lr = optimizer.param_groups[0]['lr']
@@ -367,10 +349,10 @@ def main():
 
         if not skip_A_val:
             if is_stage3:
-                if va_iou > best_iou_stage3:
-                    best_iou_stage3 = va_iou
-                    print(f"  🏆 Stage 3 热图登顶！保存为 best_stage3_iou.pth (IoU: {va_iou * 100:.2f}%)")
-                    torch.save(checkpoint, os.path.join(ckpt_dir, "best_stage3_iou.pth"))
+                if val_total_loss < best_val_loss_stage3:
+                    best_val_loss_stage3 = val_total_loss
+                    print(f"  🚀 Stage 3 终极突破！保存为 best_stage3_final.pth (IoU: {va_iou * 100:.2f}%)")
+                    torch.save(checkpoint, os.path.join(ckpt_dir, "best_stage3_final.pth"))
             elif mode == "joint":
                 if val_total_loss < best_val_loss:
                     best_val_loss = val_total_loss
@@ -387,12 +369,8 @@ def main():
             elif mode == "heat_only":
                 if val_total_loss < best_val_loss:
                     best_val_loss = val_total_loss
-                    print(f"  🚀 Stage 1 Loss新纪录！保存为 best_stage1_heat.pth (Loss: {best_val_loss:.4e})")
+                    print(f"  🚀 新纪录诞生！保存为 best_stage1_heat.pth (Loss: {best_val_loss:.4e})")
                     torch.save(checkpoint, os.path.join(ckpt_dir, "best_stage1_heat.pth"))
-                if va_iou > best_iou_stage1:
-                    best_iou_stage1 = va_iou
-                    print(f"  🔥 Stage 1 热图最佳！保存为 best_stage1_iou.pth (IoU: {va_iou * 100:.2f}%)")
-                    torch.save(checkpoint, os.path.join(ckpt_dir, "best_stage1_iou.pth"))
 
 
 if __name__ == '__main__':

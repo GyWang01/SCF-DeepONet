@@ -15,7 +15,7 @@ class EMT_SCF_Dataset(Dataset):
         self.num_p3_points = num_p3_points
         self.excite_per_sample = excite_per_sample
         self.base_seed = base_seed
-        self.current_epoch = 0
+        self.current_epoch = 0  # 【新增】用于轮转视角的追踪器
 
         self.hf = None
 
@@ -37,31 +37,8 @@ class EMT_SCF_Dataset(Dataset):
         return self.total_items
 
     def set_epoch(self, epoch):
+        """ 【新增】外部注入当前 Epoch，用于驱动轮转采样 """
         self.current_epoch = epoch
-
-    def get_physical_weights(self):
-        """ 返回当前子集的物理样本采样权重，专供 PhysicalWeightedSampler 使用 """
-        weights = []
-        for sample_idx in range(self.num_samples):
-            physical_id = self.sample_indices[sample_idx]
-            label_norm = self.labels_norm[physical_id]
-
-            cx, cy, w, l = label_norm.tolist()
-            area = w * l
-            dist_x = 1.0 - abs(cx) - w / 2.0
-            dist_y = 1.0 - abs(cy) - l / 2.0
-            dist_bound = min(dist_x, dist_y)
-
-            is_small = area < 0.025
-            is_edge = dist_bound < 0.15
-
-            # 🚀 温和权重：防止大盘崩坏！
-            weight = 1.0
-            if is_small: weight += 0.3
-            if is_edge: weight += 0.3
-
-            weights.append(weight)
-        return weights
 
     def _generate_stratified_2d_points(self, label_norm):
         if self.num_p2_points == 0:
@@ -111,15 +88,14 @@ class EMT_SCF_Dataset(Dataset):
         if self.hf is None:
             self.hf = h5py.File(self.h5_path, 'r')
 
-        sample_idx = idx // self.excite_per_sample
-        inner_idx = idx % self.excite_per_sample
-        physical_id = self.sample_indices[sample_idx]
+        local_sample_idx = idx // self.excite_per_sample
+        physical_id = self.sample_indices[local_sample_idx]
 
-        if self.excite_per_sample == 1:
-            excite_idx = 0
-        elif self.excite_per_sample == 16:
-            excite_idx = inner_idx
+        if self.excite_per_sample == 16:
+            excite_idx = idx % 16
         else:
+            # 🚀 【核心修复：轮转采样】不再纯随机，而是按 Epoch 平移，确保 4 个 Epoch 刚好覆盖 16 个视角
+            inner_idx = idx % self.excite_per_sample
             excite_idx = ((self.current_epoch * self.excite_per_sample) + inner_idx) % 16
 
         v_pair = torch.from_numpy(self.hf['v_pair'][physical_id])
