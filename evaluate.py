@@ -214,7 +214,7 @@ def main():
     device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
 
     model = SCFDeepONet_V1().to(device)
-    ckpt_path = "checkpoints/best_stage2_joint.pth"
+    ckpt_path = "checkpoints/best_stage3_iou.pth"
     print(f"📦 正在加载权重: {ckpt_path}")
     checkpoint = torch.load(ckpt_path, map_location=device)
     model.load_state_dict(checkpoint['model_state_dict'])

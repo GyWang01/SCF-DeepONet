@@ -13,8 +13,9 @@ class EMT_SCF_Dataset(Dataset):
         self.mode = mode
         self.num_p2_points = num_p2_points
         self.num_p3_points = num_p3_points
-        self.excite_per_sample = excite_per_sample  # 【新增】控制每个物理样本展开的视角数
+        self.excite_per_sample = excite_per_sample
         self.base_seed = base_seed
+        self.current_epoch = 0
 
         self.hf = None
 
@@ -30,14 +31,39 @@ class EMT_SCF_Dataset(Dataset):
             self.sample_indices = np.array(sample_indices)
 
         self.num_samples = len(self.sample_indices)
-        # 【核心减负】数据集总长度由 num_samples * 16 缩减为 num_samples * 4 (如果在 Stage 2)
         self.total_items = self.num_samples * self.excite_per_sample
 
     def __len__(self):
         return self.total_items
 
+    def set_epoch(self, epoch):
+        self.current_epoch = epoch
+
+    def get_physical_weights(self):
+        """ 返回当前子集的物理样本采样权重，专供 PhysicalWeightedSampler 使用 """
+        weights = []
+        for sample_idx in range(self.num_samples):
+            physical_id = self.sample_indices[sample_idx]
+            label_norm = self.labels_norm[physical_id]
+
+            cx, cy, w, l = label_norm.tolist()
+            area = w * l
+            dist_x = 1.0 - abs(cx) - w / 2.0
+            dist_y = 1.0 - abs(cy) - l / 2.0
+            dist_bound = min(dist_x, dist_y)
+
+            is_small = area < 0.025
+            is_edge = dist_bound < 0.15
+
+            # 🚀 温和权重：防止大盘崩坏！
+            weight = 1.0
+            if is_small: weight += 0.3
+            if is_edge: weight += 0.3
+
+            weights.append(weight)
+        return weights
+
     def _generate_stratified_2d_points(self, label_norm):
-        # 防御性逻辑：如果验证集不需要 p2，返回极小 tensor 维持 batch 结构
         if self.num_p2_points == 0:
             return torch.zeros((0, 2)), torch.zeros((0, 1))
 
@@ -85,16 +111,16 @@ class EMT_SCF_Dataset(Dataset):
         if self.hf is None:
             self.hf = h5py.File(self.h5_path, 'r')
 
-        # 【核心减负】物理索引映射
-        local_sample_idx = idx // self.excite_per_sample
-        physical_id = self.sample_indices[local_sample_idx]
+        sample_idx = idx // self.excite_per_sample
+        inner_idx = idx % self.excite_per_sample
+        physical_id = self.sample_indices[sample_idx]
 
-        # 动态视角选择策略
-        if self.excite_per_sample == 16:
-            excite_idx = idx % 16
+        if self.excite_per_sample == 1:
+            excite_idx = 0
+        elif self.excite_per_sample == 16:
+            excite_idx = inner_idx
         else:
-            # Stage 2 训练时：每个 Epoch 纯随机抽取视角，防过拟合且速度极快
-            excite_idx = np.random.randint(0, 16)
+            excite_idx = ((self.current_epoch * self.excite_per_sample) + inner_idx) % 16
 
         v_pair = torch.from_numpy(self.hf['v_pair'][physical_id])
         label_norm = self.labels_norm[physical_id]
@@ -116,11 +142,6 @@ class EMT_SCF_Dataset(Dataset):
             else:
                 point_indices = torch.randperm(self.total_points)[:self.num_p3_points]
 
-            # =====================================================================
-            # 🚀 【底层战术：性能核弹】内存级切片 (In-RAM Slicing)
-            # 不再使用 h5py 去硬盘/缓存花式挑点，直接连读 1.2MB 后用 PyTorch 内存切片！
-            # 且抛弃了 torch.sort()，保留极致的数据打乱分布
-            # =====================================================================
             coords_3d_full = self.coords_3d_field_norm
             A_target_full = self.hf['A_delta_norm'][physical_id, excite_idx, :, :]
             A0_target_full = self.hf['A0_norm'][excite_idx, :, :]
@@ -128,7 +149,6 @@ class EMT_SCF_Dataset(Dataset):
             coords_3d = coords_3d_full[point_indices]
             A_target = torch.from_numpy(A_target_full)[point_indices]
             A0_target = torch.from_numpy(A0_target_full)[point_indices]
-            # =====================================================================
 
             batch["coords_3d"] = coords_3d
             batch["A_target"] = A_target
