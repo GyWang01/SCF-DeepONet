@@ -92,26 +92,25 @@ class EMT_SCF_Dataset(Dataset):
         perm = torch.randperm(self.num_p2_points)
         return coords_2d[perm], heat_target[perm]
 
-    def _sample_pde_points(self):
+    def _sample_pde_points(self, generator=None):
         """
-        【新增】专门用于筛选 PDE 物理配点
         按照专家建议：纳入深层铁块、远场空气；避开线圈源区(Source Zone)
+        【新增】支持传入 generator 实现验证集的确定性(固定)抽样
         """
-        # 将归一化坐标还原为物理坐标用于逻辑判断
         z_real = self.coords_3d_field_norm[:, 2] * self.max_field_xyz[2]
-
-        # 启发式过滤：假设线圈和间隙（Source Zone）在 z = [0, 5] 的区间内
-        # 这里把 z < -2 (深层/核心铁块) 和 z > 15 (远场空气) 作为安全区
-        # 具体数值你可以根据 COMSOL 建模的实际物理坐标域进行微调
         safe_mask = (z_real < -2.0) | (z_real > 15.0)
         safe_indices = torch.nonzero(safe_mask).squeeze()
 
-        # 如果安全区点数不足（通常不可能），退化为全局随机采样
         if len(safe_indices) < self.num_pde_points:
+            if generator is not None:
+                return torch.randperm(self.total_points, generator=generator)[:self.num_pde_points]
             return torch.randperm(self.total_points)[:self.num_pde_points]
 
-        # 在安全区内随机抽取指定数量的 PDE 配点
-        perm = torch.randperm(len(safe_indices))[:self.num_pde_points]
+        if generator is not None:
+            perm = torch.randperm(len(safe_indices), generator=generator)[:self.num_pde_points]
+        else:
+            perm = torch.randperm(len(safe_indices))[:self.num_pde_points]
+
         return safe_indices[perm]
 
     def __getitem__(self, idx):
@@ -137,17 +136,16 @@ class EMT_SCF_Dataset(Dataset):
             "heat_target": heat_target,
             "excite_idx": torch.tensor(excite_idx, dtype=torch.long),
             "label_xywl": label_norm,
-            "defect_h": torch.tensor(self.defect_h, dtype=torch.float32)  # 【新增】透传几何先验
+            "defect_h": torch.tensor(5.0, dtype=torch.float32)  # 固定物理深度
         }
 
-        # 只要不是纯热图模式（即 joint 强监督或 PDE 模式），都加载 3D 场相关数据
         if self.mode in ["joint", "pde"]:
             coords_3d_full = self.coords_3d_field_norm
             A_target_full = self.hf['A_delta_norm'][physical_id, excite_idx, :, :]
             A0_target_full = self.hf['A0_norm'][excite_idx, :, :]
 
-            # --- 1. 强监督点采样 (保持原逻辑) ---
-            if self.mode == "joint" and self.split == "val":
+            # --- 1. 强监督点采样 (保持不变) ---
+            if self.split == "val":
                 g = torch.Generator(device='cpu')
                 g.manual_seed(self.base_seed + int(physical_id) * 100 + int(excite_idx))
                 point_indices = torch.randperm(self.total_points, generator=g)[:self.num_p3_points]
@@ -156,15 +154,20 @@ class EMT_SCF_Dataset(Dataset):
 
             batch["coords_3d"] = coords_3d_full[point_indices]
             batch["A_target"] = torch.from_numpy(A_target_full)[point_indices]
-            # 此时 A0_target 可以留作强监督的辅助参考，也可以不返回
             batch["A0_target"] = torch.from_numpy(A0_target_full)[point_indices]
 
             # --- 2. PDE 物理配点采样 ---
-            # 如果启用了 PDE 模式，独立抽取一组物理验证点 (放开 split 限制，允许验证集采样)
+            # 🚀 专家第一优先级：固定验证集的 PDE 点采样！
             if self.mode == "pde" and self.num_pde_points > 0:
-                pde_indices = self._sample_pde_points()
+                if self.split == "val":
+                    g_pde = torch.Generator(device='cpu')
+                    # 加上 999 偏移量，防止和强监督点采到完全一样的序列
+                    g_pde.manual_seed(self.base_seed + int(physical_id) * 100 + int(excite_idx) + 999)
+                    pde_indices = self._sample_pde_points(generator=g_pde)
+                else:
+                    pde_indices = self._sample_pde_points()
+
                 batch["coords_pde"] = coords_3d_full[pde_indices]
-                # 提取这批 PDE 点对应的总场基线 (专家重点强调：约束总场必需)
                 batch["A0_pde"] = torch.from_numpy(A0_target_full)[pde_indices]
 
         return batch

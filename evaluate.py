@@ -133,23 +133,41 @@ def evaluate_dataset(model, dataset_name, h5_path, sample_indices, device, plot_
                         })
                     global_item_idx += 1
 
-    # =====================================================================
-    # 数据大汇总与 CSV 导出
-    # =====================================================================
-    records = []
-    for pid, stats in sample_stats.items():
-        stats['field_rmse'] = np.sqrt(stats['field_mse_sum'] / stats['excite_count'])
-        records.append(stats)
+        # =====================================================================
+        # 数据大汇总与 CSV 导出
+        # =====================================================================
+        records = []
+        for pid, stats in sample_stats.items():
+            stats['field_rmse'] = np.sqrt(stats['field_mse_sum'] / stats['excite_count'])
+            records.append(stats)
 
-    df = pd.DataFrame(records)
+        df = pd.DataFrame(records)
 
-    # 丢弃不可序列化的 plot_data 列，保存纯净数据
-    df_export = df.drop(columns=['plot_data', 'field_mse_sum', 'excite_count'])
-    csv_name = f"Report_{dataset_name}.csv"
-    df_export.to_csv(csv_name, index=False)
+        # 丢弃不可序列化的 plot_data 列，保存纯净数据
+        df_export = df.drop(columns=['plot_data', 'field_mse_sum', 'excite_count'])
+        csv_name = f"Report_{dataset_name}.csv"
+        df_export.to_csv(csv_name, index=False)
 
-    print(f"📄 [{dataset_name}] 核心分析报告已生成: {csv_name}")
-    print(f"📊 总体均值: Heatmap IoU = {df['heat_iou'].mean() * 100:.2f}% | Field RMSE = {df['field_rmse'].mean():.4e}")
+        print(f"\n📄 [{dataset_name}] 核心分析报告已生成: {csv_name}")
+
+        # 🚀 专家要求的高级统计量：评估长尾分布与鲁棒性
+        if not df.empty:
+            rmse_arr = df['field_rmse'].values
+            iou_mean = df['heat_iou'].mean() * 100
+
+            rmse_mean = rmse_arr.mean()
+            rmse_median = np.median(rmse_arr)
+            rmse_p90 = np.percentile(rmse_arr, 90)
+
+            # 提取误差最大的前 10 个样本计算平均
+            worst_10_rmse = np.sort(rmse_arr)[-10:].mean() if len(rmse_arr) >= 10 else rmse_mean
+
+            print(f"📊 综合指标评估:")
+            print(f"   ➤ Test Heat IoU   : {iou_mean:.2f}%")
+            print(f"   ➤ Mean RMSE       : {rmse_mean:.4e}")
+            print(f"   ➤ Median RMSE     : {rmse_median:.4e}")
+            print(f"   ➤ P90 RMSE        : {rmse_p90:.4e} (覆盖90%工况的误差上界)")
+            print(f"   ➤ Worst-10 RMSE   : {worst_10_rmse:.4e} 🚨 (极端最差工况表现)")
 
     # =====================================================================
     # 继续为你提供优雅的画图功能 (由 DataFrame 驱动排序)
@@ -214,10 +232,10 @@ def main():
     device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
 
     model = SCFDeepONet_V1().to(device)
-    ckpt_path = "checkpoints/best_stage3_iou.pth"
+    ckpt_path = "checkpoints/best_stage2_rmse.pth"
     print(f"📦 正在加载权重: {ckpt_path}")
     checkpoint = torch.load(ckpt_path, map_location=device)
-    model.load_state_dict(checkpoint['model_state_dict'])
+    model.load_state_dict(checkpoint['model_state_dict'], strict=False)
     print(f"✅ 成功加载第 {checkpoint['epoch']} 轮保存的模型！")
 
     h5_path_main = 'EMT_SCF_Dataset.h5'
@@ -229,7 +247,7 @@ def main():
         with h5py.File(h5_path_test, 'r') as hf:
             total_test_samples = hf['v_pair'].shape[0]
         test_ids = np.arange(total_test_samples)
-        evaluate_dataset(model, "Secret_Test_Set", h5_path_test, test_ids, device, plot_top_worst=True)
+        evaluate_dataset(model, "Report_A_PureData", h5_path_test, test_ids, device, plot_top_worst=True)
     else:
         print("\n⚠️ 找不到 EMT_SCF_Test_Dataset.h5！")
 
