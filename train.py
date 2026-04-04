@@ -70,25 +70,28 @@ def get_grid_target(label_norm, grid_2d):
 
 
 # =========================================================================
-# 🚀 专家绝杀策略：真正的“只校准热图输出层”
+# 冻结策略管理区
 # =========================================================================
 def freeze_all_for_stage3(model):
+    for p in model.parameters(): p.requires_grad = False
+    for p in model.heatmap_trunk.heat_logits_head.parameters(): p.requires_grad = True
+
+
+def freeze_for_stage4_pde(model):
     """
-    外科手术级冻结：封死所有共享表征，防止灾难性遗忘！
+    🚀 专家止血方案 A1: 绝对死锁！
+    彻底锁死前端特征编码器和热图网络，只允许 3D field trunk 被物理梯度洗礼。
     """
-    # 1) 先将全网 100% 绝对冻结
     for p in model.parameters():
         p.requires_grad = False
-
-    # 2) 只打开热图的最终输出头 (咱们之前为了 AMP 稳定，把它命名为了 heat_logits_head)
-    for p in model.heatmap_trunk.heat_logits_head.parameters():
+    for p in model.field_trunk.parameters():
         p.requires_grad = True
 
 
 def train_epoch(model, dataloader, optimizer, scaler, heat_loss_fn, mse_loss_fn, mode, device, amp_enabled, epoch,
-                epochs_stage1, is_stage3=False):
+                epochs_stage1, A_scale, is_stage3=False):
     model.train()
-    total_heat_loss, total_A_loss = 0.0, 0.0
+    total_heat_loss, total_A_loss, total_pde_loss = 0.0, 0.0, 0.0
 
     dataloader.dataset.set_epoch(epoch)
 
@@ -96,6 +99,7 @@ def train_epoch(model, dataloader, optimizer, scaler, heat_loss_fn, mse_loss_fn,
         v_pair = batch["v_pair"].to(device)
         coords_2d = batch["coords_2d"].to(device)
         heat_target = batch["heat_target"].to(device)
+        label_norm = batch["label_xywl"].to(device)
 
         optimizer.zero_grad(set_to_none=True)
 
@@ -104,19 +108,42 @@ def train_epoch(model, dataloader, optimizer, scaler, heat_loss_fn, mse_loss_fn,
             heat_out = model.query_heatmap(branch_out, coords_2d)
             loss_heat = heat_loss_fn(heat_out["heat_logits"], heat_out["heat_prob"], heat_target)
 
-            if mode == "heat_only" or is_stage3:
-                loss = loss_heat
-            elif mode == "joint":
+            if mode in ["joint", "pde"]:
                 coords_3d = batch["coords_3d"].to(device)
                 excite_idx = batch["excite_idx"].to(device)
                 A_target = batch["A_target"].to(device)
 
                 field_out = model.query_field(branch_out, coords_3d, excite_idx)
                 loss_A = mse_loss_fn(field_out["A_delta_norm"], A_target)
-
                 weight_A = 0.5 if (epoch - epochs_stage1) <= 8 else 1.0
-                loss = (1.0 / 16.0) * loss_heat + weight_A * loss_A
-                total_A_loss += loss_A.item()
+
+                if mode == "joint":
+                    loss = (1.0 / 16.0) * loss_heat + weight_A * loss_A
+            else:
+                loss = loss_heat
+
+        if mode == "pde":
+            coords_pde = batch["coords_pde"].to(device)
+            A0_pde = batch["A0_pde"].to(device)
+            defect_h = batch["defect_h"].to(device)
+
+            branch_out_fp32 = {k: v.float() for k, v in branch_out.items()}
+
+            with autocast('cuda', enabled=False):
+                loss_pde_val, loss_div_val = model.compute_pde_loss(
+                    branch_out_fp32, coords_pde.float(), A0_pde.float(),
+                    excite_idx, label_norm.float(), defect_h.float(), A_scale.float()
+                )
+
+            # 🚀 专家止血方案 A2: 将原始 SI 残差的权重压至极小，实现和平共处
+            lambda_pde = 1e-12
+            lambda_div = 1e-8
+
+            loss = (1.0 / 16.0) * loss_heat + weight_A * loss_A + lambda_pde * loss_pde_val + lambda_div * loss_div_val
+            total_pde_loss += loss_pde_val.item()
+
+        if mode in ["joint", "pde"]:
+            total_A_loss += loss_A.item()
 
         scaler.scale(loss).backward()
         scaler.unscale_(optimizer)
@@ -127,15 +154,16 @@ def train_epoch(model, dataloader, optimizer, scaler, heat_loss_fn, mse_loss_fn,
         total_heat_loss += loss_heat.item()
 
     num_batches = len(dataloader)
-    return total_heat_loss / num_batches, total_A_loss / num_batches if mode == "joint" else 0.0
+    avg_pde = total_pde_loss / num_batches if mode == "pde" else 0.0
+    avg_A = total_A_loss / num_batches if mode in ["joint", "pde"] else 0.0
+    return total_heat_loss / num_batches, avg_A, avg_pde
 
 
 @torch.no_grad()
 def validate(model, dataloader, heat_loss_fn, mse_loss_fn, mode, device, val_grid, amp_enabled, skip_A_val,
              is_stage3=False):
     model.eval()
-    total_heat_loss, total_A_loss = 0.0, 0.0
-    total_iou, total_rmse = 0.0, 0.0
+    total_heat_loss, total_A_loss, total_iou, total_rmse = 0.0, 0.0, 0.0, 0.0
     val_physical_count = 0
 
     for batch in dataloader:
@@ -155,20 +183,17 @@ def validate(model, dataloader, heat_loss_fn, mse_loss_fn, mode, device, val_gri
                     heat_out = model.query_heatmap(single_branch, grid_input)
                     pred_logits = heat_out["heat_logits"][0]
                     pred_prob = heat_out["heat_prob"][0]
-
-                    label_norm = batch["label_xywl"][b]
-                    target_mask = get_grid_target(label_norm, val_grid).to(device)
+                    target_mask = get_grid_target(batch["label_xywl"][b], val_grid).to(device)
 
                     total_heat_loss += heat_loss_fn(pred_logits, pred_prob, target_mask).item()
                     total_iou += calculate_iou(pred_prob, target_mask)
 
-            if mode == "joint" and not skip_A_val and not is_stage3:
+            if mode in ["joint", "pde"] and not skip_A_val and not is_stage3:
                 coords_3d = batch["coords_3d"].to(device)
                 A_target = batch["A_target"].to(device)
 
                 field_out = model.query_field(branch_out, coords_3d, excite_idx)
                 mse = mse_loss_fn(field_out["A_delta_norm"], A_target)
-
                 total_A_loss += mse.item()
                 total_rmse += torch.sqrt(mse).item()
 
@@ -176,7 +201,7 @@ def validate(model, dataloader, heat_loss_fn, mse_loss_fn, mode, device, val_gri
     va_heat = total_heat_loss / val_physical_count if val_physical_count > 0 else 0.0
     va_iou = total_iou / val_physical_count if val_physical_count > 0 else 0.0
 
-    if mode == "joint" and not skip_A_val and not is_stage3:
+    if mode in ["joint", "pde"] and not skip_A_val and not is_stage3:
         va_A = total_A_loss / num_batches
         va_rmse = total_rmse / num_batches
     else:
@@ -187,23 +212,31 @@ def validate(model, dataloader, heat_loss_fn, mse_loss_fn, mode, device, val_gri
 
 def get_dataloaders(h5_path, train_ids, val_ids, mode, batch_size, p2_train, p3_train, p2_val, p3_val, excite_train,
                     excite_val):
+    # 🚀 专家止血方案 A4: 将 PDE 配点数降至 256
+    num_pde = 256 if mode == "pde" else 0
+
+    n_workers = 0 if mode == "pde" else 4
+    pers_workers = False if mode == "pde" else True
+
     print(
-        f"\n🔄 装载 {mode.upper()} 管道 | BS={batch_size} | P3={p3_train}/{p3_val} | Excite={excite_train}/{excite_val}")
+        f"\n🔄 装载 {mode.upper()} 管道 | BS={batch_size} | P3={p3_train}/{p3_val} | PDE_Pts={num_pde} | Excite={excite_train}/{excite_val}")
 
     train_dataset = EMT_SCF_Dataset(h5_path, sample_indices=train_ids, split="train", mode=mode,
-                                    num_p2_points=p2_train, num_p3_points=p3_train, excite_per_sample=excite_train)
+                                    num_p2_points=p2_train, num_p3_points=p3_train, num_pde_points=num_pde,
+                                    excite_per_sample=excite_train)
     val_dataset = EMT_SCF_Dataset(h5_path, sample_indices=val_ids, split="val", mode=mode,
-                                  num_p2_points=p2_val, num_p3_points=p3_val, excite_per_sample=excite_val)
+                                  num_p2_points=p2_val, num_p3_points=p3_val, num_pde_points=0,
+                                  excite_per_sample=excite_val)
 
-    train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True, num_workers=4, pin_memory=True,
-                              persistent_workers=True, worker_init_fn=worker_init_fn)
-    val_loader = DataLoader(val_dataset, batch_size=batch_size, shuffle=False, num_workers=4, pin_memory=True,
+    train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True, num_workers=n_workers,
+                              pin_memory=True, persistent_workers=pers_workers, worker_init_fn=worker_init_fn)
+    val_loader = DataLoader(val_dataset, batch_size=batch_size, shuffle=False, num_workers=n_workers, pin_memory=True,
                             worker_init_fn=worker_init_fn)
     return train_loader, val_loader
 
 
 def main():
-    print("🚀 启动 SCF-DeepONet 究极性能版训练引擎 (真·热图精修版本)...")
+    print("🚀 启动 SCF-DeepONet 究极性能版训练引擎 (PDE Plan A 止血版)...")
     seed_everything(42)
 
     ckpt_dir, splits_dir = "checkpoints", "splits"
@@ -216,26 +249,24 @@ def main():
     h5_path = 'EMT_SCF_Dataset.h5'
     with h5py.File(h5_path, 'r') as hf:
         total_physical_samples = hf['v_pair'].shape[0]
+        A_scale_val = torch.tensor(hf.attrs['A_scale'], dtype=torch.float32, device=device)
 
     all_ids = np.arange(total_physical_samples)
     np.random.shuffle(all_ids)
     train_ids = all_ids[:850];
     val_ids = all_ids[850:]
-    np.save(os.path.join(splits_dir, "train_ids.npy"), train_ids)
-    np.save(os.path.join(splits_dir, "val_ids.npy"), val_ids)
 
     epochs_stage1 = 20
     epochs_stage2 = 80
-    # 🚀 【缩短课表】只调校最终概率决策层，5个Epoch就足够摸清底细了
     epochs_stage3 = 5
-    total_epochs = epochs_stage1 + epochs_stage2 + epochs_stage3
+    epochs_stage4 = 15
+    total_epochs = epochs_stage1 + epochs_stage2 + epochs_stage3 + epochs_stage4
 
-    bs_stage1 = 24
+    bs_stage1, bs_stage2 = 24, 8
     p2_train_s1, p3_train_s1 = 2000, 100
     p2_val_s1, p3_val_s1 = 256, 100
     excite_train_s1, excite_val_s1 = 16, 16
 
-    bs_stage2 = 8
     p2_train_s2, p3_train_s2 = 2000, 6000
     p2_val_s2, p3_val_s2 = 256, 2000
     excite_train_s2, excite_val_s2 = 4, 16
@@ -256,121 +287,118 @@ def main():
     scheduler = optim.lr_scheduler.ReduceLROnPlateau(optimizer, mode='min', factor=0.5, patience=6)
     scaler = GradScaler('cuda', enabled=amp_enabled)
 
-    best_val_loss = float('inf')
-    best_iou_stage2 = 0.0
-    best_rmse_stage2 = float('inf')
-    best_val_loss_stage3 = float('inf')
+    best_val_loss, best_iou_stage2, best_rmse_stage2 = float('inf'), 0.0, float('inf')
+    best_val_loss_stage3, best_rmse_stage4, best_joint_stage4 = float('inf'), float('inf'), float('inf')
 
     last_va_A, last_va_rmse = 0.0, 0.0
 
-    print("\n================ 开始三阶段课表训练 (Curriculum Training) ================")
-    for epoch in range(1, total_epochs + 1):
+    print("\n================ 开始四阶段课表训练 (Curriculum Training w/ PDE) ================")
+    START_EPOCH = 106
+
+    for epoch in range(START_EPOCH, total_epochs + 1):
         start_time = time.time()
 
-        is_stage3 = epoch > (epochs_stage1 + epochs_stage2)
-        mode = "heat_only" if epoch <= epochs_stage1 or is_stage3 else "joint"
+        is_stage3 = (epoch > epochs_stage1 + epochs_stage2) and (epoch <= epochs_stage1 + epochs_stage2 + epochs_stage3)
+        is_stage4 = epoch > (epochs_stage1 + epochs_stage2 + epochs_stage3)
 
-        # ================== 阶段 2：联合训练 ==================
+        if epoch <= epochs_stage1 or is_stage3:
+            mode = "heat_only"
+        elif is_stage4:
+            mode = "pde"
+        else:
+            mode = "joint"
+
         if epoch == epochs_stage1 + 1:
-            print("\n🌟 触发进化！进入 Stage 2: 2D & 3D 联合训练阶段 🌟")
+            print("\n🌟 进入 Stage 2: 2D & 3D 联合训练阶段 🌟")
             best_heat_ckpt = os.path.join(ckpt_dir, "best_stage1_heat.pth")
             if os.path.exists(best_heat_ckpt):
-                model.load_state_dict(torch.load(best_heat_ckpt, map_location=device)['model_state_dict'])
-                print("✅ 权重回滚成功！")
-
-            best_val_loss = float('inf')
+                model.load_state_dict(torch.load(best_heat_ckpt, map_location=device)['model_state_dict'], strict=False)
             for param_group in optimizer.param_groups: param_group['lr'] = init_lr
-            scheduler = optim.lr_scheduler.ReduceLROnPlateau(optimizer, mode='min', factor=0.5, patience=6)
-
             del train_loader, val_loader
-            train_loader, val_loader = get_dataloaders(
-                h5_path, train_ids, val_ids, mode="joint", batch_size=bs_stage2,
-                p2_train=p2_train_s2, p3_train=p3_train_s2, p2_val=p2_val_s2, p3_val=p3_val_s2,
-                excite_train=excite_train_s2, excite_val=excite_val_s2
-            )
+            train_loader, val_loader = get_dataloaders(h5_path, train_ids, val_ids, mode="joint", batch_size=bs_stage2,
+                                                       p2_train=p2_train_s2, p3_train=p3_train_s2, p2_val=p2_val_s2,
+                                                       p3_val=p3_val_s2, excite_train=excite_train_s2,
+                                                       excite_val=excite_val_s2)
 
-        # ================== 阶段 3：真正的热图精修 ==================
         if epoch == epochs_stage1 + epochs_stage2 + 1:
-            print("\n🔥 终极冲刺！进入 Stage 3: Heatmap Polish (绝对冻结防崩坏版) 🔥")
+            print("\n🔥 进入 Stage 3: Heatmap Polish 绝对冻结版 🔥")
             best_iou_ckpt = os.path.join(ckpt_dir, "best_stage2_iou.pth")
             if os.path.exists(best_iou_ckpt):
-                model.load_state_dict(torch.load(best_iou_ckpt, map_location=device)['model_state_dict'])
-                print(f"✅ 成功加载 Stage 2 最佳 IoU 权重进行精修！")
-
-            # 🚀 【核心整改 1】执行外科手术级冻结，护住所有共享表征
+                model.load_state_dict(torch.load(best_iou_ckpt, map_location=device)['model_state_dict'], strict=False)
             freeze_all_for_stage3(model)
-
-            # 🚀 【核心整改 2】彻底重置优化器，丢弃历史动量包袱！
             trainable_params = [p for p in model.parameters() if p.requires_grad]
             optimizer = optim.AdamW(trainable_params, lr=3e-5, weight_decay=1e-5)
-            # 重置对应的 scheduler
             scheduler = optim.lr_scheduler.ReduceLROnPlateau(optimizer, mode='min', factor=0.5, patience=3)
+            del train_loader, val_loader
+            train_loader, val_loader = get_dataloaders(h5_path, train_ids, val_ids, mode="heat_only",
+                                                       batch_size=bs_stage1, p2_train=p2_train_s1, p3_train=p3_train_s1,
+                                                       p2_val=p2_val_s1, p3_val=p3_val_s1, excite_train=excite_train_s1,
+                                                       excite_val=excite_val_s1)
+
+        if epoch == epochs_stage1 + epochs_stage2 + epochs_stage3 + 1:
+            print("\n⚛️ 数据-物理双驱动！进入 Stage 4: PDE Plan A 止血版 ⚛️")
+            best_rmse_ckpt = os.path.join(ckpt_dir, "best_stage2_rmse.pth")
+            if os.path.exists(best_rmse_ckpt):
+                model.load_state_dict(torch.load(best_rmse_ckpt, map_location=device)['model_state_dict'], strict=False)
+                print(f"✅ 成功回滚至 Stage 2 最佳 RMSE 权重，作为 PDE 基底！")
+
+            freeze_for_stage4_pde(model)
+            trainable_params = [p for p in model.parameters() if p.requires_grad]
+
+            # 🚀 专家止血方案 A3: 学习率降档至 1e-5
+            optimizer = optim.AdamW(trainable_params, lr=1e-5, weight_decay=1e-5)
+            scheduler = optim.lr_scheduler.ReduceLROnPlateau(optimizer, mode='min', factor=0.5, patience=4)
 
             del train_loader, val_loader
-            train_loader, val_loader = get_dataloaders(
-                h5_path, train_ids, val_ids, mode="heat_only", batch_size=bs_stage1,
-                p2_train=p2_train_s1, p3_train=p3_train_s1, p2_val=p2_val_s1, p3_val=p3_val_s1,
-                excite_train=excite_train_s1, excite_val=excite_val_s1
-            )
+            train_loader, val_loader = get_dataloaders(h5_path, train_ids, val_ids, mode="pde", batch_size=bs_stage2,
+                                                       p2_train=p2_train_s2, p3_train=p3_train_s2, p2_val=p2_val_s2,
+                                                       p3_val=p3_val_s2, excite_train=excite_train_s2,
+                                                       excite_val=excite_val_s2)
 
-        tr_heat, tr_A = train_epoch(model, train_loader, optimizer, scaler, heat_loss_fn, mse_loss_fn, mode, device,
-                                    amp_enabled, epoch, epochs_stage1, is_stage3)
+        tr_heat, tr_A, tr_pde = train_epoch(
+            model, train_loader, optimizer, scaler, heat_loss_fn, mse_loss_fn,
+            mode, device, amp_enabled, epoch, epochs_stage1, A_scale_val, is_stage3
+        )
 
-        skip_A_val = (mode == "joint") and (epoch % 2 != 0) and not is_stage3
-        va_heat, va_A_curr, va_iou, va_rmse_curr = validate(model, val_loader, heat_loss_fn, mse_loss_fn, mode, device,
-                                                            val_grid, amp_enabled, skip_A_val, is_stage3)
+        skip_A_val = (mode in ["joint", "pde"]) and (epoch % 2 != 0) and not is_stage3
+        va_heat, va_A_curr, va_iou, va_rmse_curr = validate(
+            model, val_loader, heat_loss_fn, mse_loss_fn, mode, device, val_grid, amp_enabled, skip_A_val, is_stage3
+        )
 
-        if not skip_A_val and not is_stage3:
-            last_va_A, last_va_rmse = va_A_curr, va_rmse_curr
+        if not skip_A_val and not is_stage3: last_va_A, last_va_rmse = va_A_curr, va_rmse_curr
 
         val_total_loss = va_heat if (mode == "heat_only" or is_stage3) else (1.0 / 16.0) * va_heat + last_va_A
-
-        if not skip_A_val:
-            scheduler.step(val_total_loss)
+        if not skip_A_val: scheduler.step(val_total_loss)
 
         current_lr = optimizer.param_groups[0]['lr']
         epoch_time = time.time() - start_time
 
-        stage_name = "STAGE 3" if is_stage3 else mode.upper()
+        stage_name = f"STAGE 4" if is_stage4 else f"STAGE 3" if is_stage3 else f"STAGE 2"
         skip_mark = " (Skipped)" if skip_A_val else ""
         print(
-            f"Epoch [{epoch:03d}/{total_epochs:03d}] | Mode: {stage_name:9s} | LR: {current_lr:.2e} | Time: {epoch_time:.1f}s")
-        print(f"  [Train] Heat Loss: {tr_heat:.4f} | A_MSE Loss: {tr_A:.4e}")
-        print(f"  [Val]   Heat Loss: {va_heat:.4f} | Heat IoU:   {va_iou * 100:05.2f}%")
-        if mode == "joint" and not is_stage3:
-            print(f"  [Val]   A_MSE:     {last_va_A:.4e}{skip_mark} | A_RMSE:     {last_va_rmse:.4e}{skip_mark}")
+            f"Epoch [{epoch:03d}/{total_epochs:03d}] | {stage_name} ({mode.upper()}) | LR: {current_lr:.2e} | Time: {epoch_time:.1f}s")
+        print(f"  [Train] Heat: {tr_heat:.4f} | A_MSE: {tr_A:.4e}" + (
+            f" | PDE(Raw SI): {tr_pde:.4e}" if mode == "pde" else ""))
+        print(f"  [Val]   Heat: {va_heat:.4f} | IoU: {va_iou * 100:05.2f}%")
+        if mode in ["joint", "pde"] and not is_stage3:
+            print(f"  [Val]   A_MSE: {last_va_A:.4e}{skip_mark} | A_RMSE: {last_va_rmse:.4e}{skip_mark}")
 
         checkpoint = {
             'epoch': epoch, 'model_state_dict': model.state_dict(),
-            'optimizer_state_dict': optimizer.state_dict(),
-            'val_loss': val_total_loss, 'mode': mode
+            'optimizer_state_dict': optimizer.state_dict(), 'val_loss': val_total_loss, 'mode': mode
         }
         torch.save(checkpoint, os.path.join(ckpt_dir, "latest_model.pth"))
 
         if not skip_A_val:
-            if is_stage3:
-                if val_total_loss < best_val_loss_stage3:
-                    best_val_loss_stage3 = val_total_loss
-                    print(f"  🚀 Stage 3 终极突破！保存为 best_stage3_final.pth (IoU: {va_iou * 100:.2f}%)")
-                    torch.save(checkpoint, os.path.join(ckpt_dir, "best_stage3_final.pth"))
-            elif mode == "joint":
-                if val_total_loss < best_val_loss:
-                    best_val_loss = val_total_loss
-                    print(f"  🚀 综合最佳！保存为 best_stage2_joint.pth (Total Loss: {best_val_loss:.4e})")
-                    torch.save(checkpoint, os.path.join(ckpt_dir, "best_stage2_joint.pth"))
-                if va_iou > best_iou_stage2:
-                    best_iou_stage2 = va_iou
-                    print(f"  🔥 热图最佳！保存为 best_stage2_iou.pth (IoU: {va_iou * 100:.2f}%)")
-                    torch.save(checkpoint, os.path.join(ckpt_dir, "best_stage2_iou.pth"))
-                if last_va_rmse < best_rmse_stage2:
-                    best_rmse_stage2 = last_va_rmse
-                    print(f"  🌊 3D 场最佳！保存为 best_stage2_rmse.pth (RMSE: {last_va_rmse:.4e})")
-                    torch.save(checkpoint, os.path.join(ckpt_dir, "best_stage2_rmse.pth"))
-            elif mode == "heat_only":
-                if val_total_loss < best_val_loss:
-                    best_val_loss = val_total_loss
-                    print(f"  🚀 新纪录诞生！保存为 best_stage1_heat.pth (Loss: {best_val_loss:.4e})")
-                    torch.save(checkpoint, os.path.join(ckpt_dir, "best_stage1_heat.pth"))
+            if is_stage4:
+                if last_va_rmse < best_rmse_stage4:
+                    best_rmse_stage4 = last_va_rmse
+                    print(f"  ⚛️ PDE 精调新纪录！保存为 best_stage4_pde_rmse.pth (RMSE: {last_va_rmse:.4e})")
+                    torch.save(checkpoint, os.path.join(ckpt_dir, "best_stage4_pde_rmse.pth"))
+                if val_total_loss < best_joint_stage4:
+                    best_joint_stage4 = val_total_loss
+                    print(f"  ⚖️ PDE 综合最佳！保存为 best_stage4_pde_joint.pth")
+                    torch.save(checkpoint, os.path.join(ckpt_dir, "best_stage4_pde_joint.pth"))
 
 
 if __name__ == '__main__':
