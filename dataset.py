@@ -160,8 +160,8 @@ class EMT_SCF_Dataset(Dataset):
             batch["A0_target"] = torch.from_numpy(A0_target_full)[point_indices]
 
             # --- 2. PDE 物理配点采样 ---
-            # 如果启用了 PDE 模式，独立抽取一组物理验证点
-            if self.mode == "pde" and self.split == "train":
+            # 如果启用了 PDE 模式，独立抽取一组物理验证点 (放开 split 限制，允许验证集采样)
+            if self.mode == "pde" and self.num_pde_points > 0:
                 pde_indices = self._sample_pde_points()
                 batch["coords_pde"] = coords_3d_full[pde_indices]
                 # 提取这批 PDE 点对应的总场基线 (专家重点强调：约束总场必需)

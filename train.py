@@ -69,27 +69,18 @@ def get_grid_target(label_norm, grid_2d):
     return (in_x & in_y).float().unsqueeze(1)
 
 
-# =========================================================================
-# 冻结策略管理区
-# =========================================================================
 def freeze_all_for_stage3(model):
     for p in model.parameters(): p.requires_grad = False
     for p in model.heatmap_trunk.heat_logits_head.parameters(): p.requires_grad = True
 
 
 def freeze_for_stage4_pde(model):
-    """
-    🚀 专家止血方案：绝对死锁！
-    彻底锁死前端特征编码器和热图网络，只允许 3D field trunk 被物理梯度洗礼。
-    """
-    for p in model.parameters():
-        p.requires_grad = False
-    for p in model.field_trunk.parameters():
-        p.requires_grad = True
+    for p in model.parameters(): p.requires_grad = False
+    for p in model.field_trunk.parameters(): p.requires_grad = True
 
 
 def train_epoch(model, dataloader, optimizer, scaler, heat_loss_fn, mse_loss_fn, mode, device, amp_enabled, epoch,
-                epochs_stage1, A_scale, is_stage3=False):
+                epochs_stage1, A_scale, start_stage4_epoch, is_stage3=False):
     model.train()
     total_heat_loss, total_A_loss, total_pde_loss = 0.0, 0.0, 0.0
     epoch_raw_rms, epoch_rel_rms = 0.0, 0.0
@@ -131,14 +122,16 @@ def train_epoch(model, dataloader, optimizer, scaler, heat_loss_fn, mse_loss_fn,
             branch_out_fp32 = {k: v.float() for k, v in branch_out.items()}
 
             with autocast('cuda', enabled=False):
-                # 接收修改后的 4 个返回值
                 loss_pde_val, loss_div_val, raw_rms, rel_rms = model.compute_pde_loss(
                     branch_out_fp32, coords_pde.float(), A0_pde.float(),
                     excite_idx, label_norm.float(), defect_h.float(), A_scale.float()
                 )
 
-            # 🚀 专家 Plan B 推荐参数：
-            lambda_pde = 1e-4
+            # 🚀 专家方案：加入 Warmup 机制！前 5 个 Epoch 线性增长到 1e-4
+            current_pde_epoch = epoch - start_stage4_epoch + 1
+            warmup_factor = min(current_pde_epoch / 5.0, 1.0)
+
+            lambda_pde = 1e-4 * warmup_factor
             lambda_div = 0.0
 
             loss = (1.0 / 16.0) * loss_heat + weight_A * loss_A + lambda_pde * loss_pde_val + lambda_div * loss_div_val
@@ -161,18 +154,17 @@ def train_epoch(model, dataloader, optimizer, scaler, heat_loss_fn, mse_loss_fn,
     num_batches = len(dataloader)
     avg_pde = total_pde_loss / num_batches if mode == "pde" else 0.0
     avg_A = total_A_loss / num_batches if mode in ["joint", "pde"] else 0.0
-
-    # 组装诊断指标
     diags = (epoch_raw_rms / num_batches, epoch_rel_rms / num_batches) if mode == "pde" else None
 
     return total_heat_loss / num_batches, avg_A, avg_pde, diags
 
 
-@torch.no_grad()
-def validate(model, dataloader, heat_loss_fn, mse_loss_fn, mode, device, val_grid, amp_enabled, skip_A_val,
+@torch.no_grad()  # 默认全局无梯度
+def validate(model, dataloader, heat_loss_fn, mse_loss_fn, mode, device, val_grid, amp_enabled, skip_A_val, A_scale,
              is_stage3=False):
     model.eval()
     total_heat_loss, total_A_loss, total_iou, total_rmse = 0.0, 0.0, 0.0, 0.0
+    total_val_raw_rms, total_val_rel_rms = 0.0, 0.0
     val_physical_count = 0
 
     for batch in dataloader:
@@ -206,6 +198,25 @@ def validate(model, dataloader, heat_loss_fn, mse_loss_fn, mode, device, val_gri
                 total_A_loss += mse.item()
                 total_rmse += torch.sqrt(mse).item()
 
+        # 🚀 专家方案：在验证集独立计算 PDE 残差
+        if mode == "pde" and not skip_A_val and not is_stage3:
+            coords_pde = batch["coords_pde"].to(device)
+            A0_pde = batch["A0_pde"].to(device)
+            defect_h = batch["defect_h"].to(device)
+            label_norm = batch["label_xywl"].to(device)
+
+            branch_out_fp32 = {k: v.float() for k, v in branch_out.items()}
+
+            # 🧨 技术难点破解：局部强行开启 Autograd，否则无法计算二阶偏导
+            with torch.enable_grad():
+                with autocast('cuda', enabled=False):
+                    _, _, raw_rms, rel_rms = model.compute_pde_loss(
+                        branch_out_fp32, coords_pde.float(), A0_pde.float(),
+                        excite_idx, label_norm.float(), defect_h.float(), A_scale.float()
+                    )
+            total_val_raw_rms += raw_rms
+            total_val_rel_rms += rel_rms
+
     num_batches = len(dataloader)
     va_heat = total_heat_loss / val_physical_count if val_physical_count > 0 else 0.0
     va_iou = total_iou / val_physical_count if val_physical_count > 0 else 0.0
@@ -216,25 +227,28 @@ def validate(model, dataloader, heat_loss_fn, mse_loss_fn, mode, device, val_gri
     else:
         va_A, va_rmse = 0.0, 0.0
 
-    return va_heat, va_A, va_iou, va_rmse
+    val_diags = (total_val_raw_rms / num_batches, total_val_rel_rms / num_batches) if mode == "pde" else None
+
+    return va_heat, va_A, va_iou, va_rmse, val_diags
 
 
 def get_dataloaders(h5_path, train_ids, val_ids, mode, batch_size, p2_train, p3_train, p2_val, p3_val, excite_train,
                     excite_val):
-    # 🚀 专家保守方案：将 PDE 配点数降至 256
     num_pde = 256 if mode == "pde" else 0
+    # 🚀 确保验证集也分配了同样的 PDE 计算点
+    val_num_pde = 256 if mode == "pde" else 0
 
     n_workers = 0 if mode == "pde" else 4
     pers_workers = False if mode == "pde" else True
 
     print(
-        f"\n🔄 装载 {mode.upper()} 管道 | BS={batch_size} | P3={p3_train}/{p3_val} | PDE_Pts={num_pde} | Excite={excite_train}/{excite_val}")
+        f"\n🔄 装载 {mode.upper()} 管道 | BS={batch_size} | P3={p3_train}/{p3_val} | PDE_Pts={num_pde}/{val_num_pde} | Excite={excite_train}/{excite_val}")
 
     train_dataset = EMT_SCF_Dataset(h5_path, sample_indices=train_ids, split="train", mode=mode,
                                     num_p2_points=p2_train, num_p3_points=p3_train, num_pde_points=num_pde,
                                     excite_per_sample=excite_train)
     val_dataset = EMT_SCF_Dataset(h5_path, sample_indices=val_ids, split="val", mode=mode,
-                                  num_p2_points=p2_val, num_p3_points=p3_val, num_pde_points=0,
+                                  num_p2_points=p2_val, num_p3_points=p3_val, num_pde_points=val_num_pde,
                                   excite_per_sample=excite_val)
 
     train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True, num_workers=n_workers,
@@ -245,11 +259,11 @@ def get_dataloaders(h5_path, train_ids, val_ids, mode, batch_size, p2_train, p3_
 
 
 def main():
-    print("🚀 启动 SCF-DeepONet 究极性能版训练引擎 (PDE Plan B: Relative Residual)...")
+    print("🚀 启动 SCF-DeepONet 究极性能版训练引擎 (PDE 专家终极打磨版)...")
     seed_everything(42)
 
     ckpt_dir, splits_dir = "checkpoints", "splits"
-    os.makedirs(ckpt_dir, exist_ok=True)
+    os.makedirs(ckpt_dir, exist_ok=True);
     os.makedirs(splits_dir, exist_ok=True)
 
     device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
@@ -268,7 +282,7 @@ def main():
     epochs_stage1 = 20
     epochs_stage2 = 80
     epochs_stage3 = 5
-    epochs_stage4 = 15
+    epochs_stage4 = 30  # 🚀 专家方案：拉长 PDE 磨合期到 30 个 Epoch
     total_epochs = epochs_stage1 + epochs_stage2 + epochs_stage3 + epochs_stage4
 
     bs_stage1, bs_stage2 = 24, 8
@@ -302,8 +316,8 @@ def main():
     last_va_A, last_va_rmse = 0.0, 0.0
 
     print("\n================ 开始四阶段课表训练 (Curriculum Training w/ PDE) ================")
-    # 💡 快捷跳转到 Stage 4
     START_EPOCH = 106
+    start_stage4_epoch = epochs_stage1 + epochs_stage2 + epochs_stage3 + 1
 
     for epoch in range(START_EPOCH, total_epochs + 1):
         start_time = time.time()
@@ -345,8 +359,8 @@ def main():
                                                        p2_val=p2_val_s1, p3_val=p3_val_s1, excite_train=excite_train_s1,
                                                        excite_val=excite_val_s1)
 
-        if epoch == epochs_stage1 + epochs_stage2 + epochs_stage3 + 1:
-            print("\n⚛️ 数据-物理双驱动！进入 Stage 4: PDE Plan B (Relative Residual) ⚛️")
+        if epoch == start_stage4_epoch:
+            print("\n⚛️ 数据-物理双驱动！进入 Stage 4: 专家精调路线 (Warmup + 30 Epochs) ⚛️")
             best_rmse_ckpt = os.path.join(ckpt_dir, "best_stage2_rmse.pth")
             if os.path.exists(best_rmse_ckpt):
                 model.load_state_dict(torch.load(best_rmse_ckpt, map_location=device)['model_state_dict'], strict=False)
@@ -355,7 +369,6 @@ def main():
             freeze_for_stage4_pde(model)
             trainable_params = [p for p in model.parameters() if p.requires_grad]
 
-            # 🚀 专家保守方案：学习率降档至 1e-5
             optimizer = optim.AdamW(trainable_params, lr=1e-5, weight_decay=1e-5)
             scheduler = optim.lr_scheduler.ReduceLROnPlateau(optimizer, mode='min', factor=0.5, patience=4)
 
@@ -365,15 +378,15 @@ def main():
                                                        p3_val=p3_val_s2, excite_train=excite_train_s2,
                                                        excite_val=excite_val_s2)
 
-        # 接收额外的诊断信息
-        tr_heat, tr_A, tr_pde, diags = train_epoch(
+        tr_heat, tr_A, tr_pde, tr_diags = train_epoch(
             model, train_loader, optimizer, scaler, heat_loss_fn, mse_loss_fn,
-            mode, device, amp_enabled, epoch, epochs_stage1, A_scale_val, is_stage3
+            mode, device, amp_enabled, epoch, epochs_stage1, A_scale_val, start_stage4_epoch, is_stage3
         )
 
         skip_A_val = (mode in ["joint", "pde"]) and (epoch % 2 != 0) and not is_stage3
-        va_heat, va_A_curr, va_iou, va_rmse_curr = validate(
-            model, val_loader, heat_loss_fn, mse_loss_fn, mode, device, val_grid, amp_enabled, skip_A_val, is_stage3
+        va_heat, va_A_curr, va_iou, va_rmse_curr, va_diags = validate(
+            model, val_loader, heat_loss_fn, mse_loss_fn, mode, device, val_grid, amp_enabled, skip_A_val, A_scale_val,
+            is_stage3
         )
 
         if not skip_A_val and not is_stage3: last_va_A, last_va_rmse = va_A_curr, va_rmse_curr
@@ -386,15 +399,24 @@ def main():
 
         stage_name = f"STAGE 4" if is_stage4 else f"STAGE 3" if is_stage3 else f"STAGE 2"
         skip_mark = " (Skipped)" if skip_A_val else ""
+
+        # 🚀 专家点名的打印日志体系
         print(
             f"Epoch [{epoch:03d}/{total_epochs:03d}] | {stage_name} ({mode.upper()}) | LR: {current_lr:.2e} | Time: {epoch_time:.1f}s")
+
+        # 打印当前计算出的 Warmup λ (仅供显示)
+        curr_lambda = 1e-4 * min((epoch - start_stage4_epoch + 1) / 5.0, 1.0) if mode == "pde" else 0.0
+
         print(f"  [Train] Heat: {tr_heat:.4f} | A_MSE: {tr_A:.4e}" + (
-            f" | PDE(Rel): {tr_pde:.4f}" if mode == "pde" else ""))
-        if mode == "pde" and diags is not None:
-            print(f"          > Diags: Raw RMS = {diags[0]:.2e} | Rel RMS = {diags[1]:.4f}")
+            f" | PDE(Rel): {tr_pde:.4f} (λ={curr_lambda:.1e})" if mode == "pde" else ""))
+        if mode == "pde" and tr_diags is not None:
+            print(f"          > Train Diags: Raw RMS = {tr_diags[0]:.2e} | Rel RMS = {tr_diags[1]:.4f}")
+
         print(f"  [Val]   Heat: {va_heat:.4f} | IoU: {va_iou * 100:05.2f}%")
         if mode in ["joint", "pde"] and not is_stage3:
             print(f"  [Val]   A_MSE: {last_va_A:.4e}{skip_mark} | A_RMSE: {last_va_rmse:.4e}{skip_mark}")
+            if mode == "pde" and va_diags is not None and not skip_A_val:
+                print(f"          > Val Diags  : Raw RMS = {va_diags[0]:.2e} | Rel RMS = {va_diags[1]:.4f} 🎯")
 
         checkpoint = {
             'epoch': epoch, 'model_state_dict': model.state_dict(),
