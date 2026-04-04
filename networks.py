@@ -3,7 +3,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 
-# ================= 基础组件 (保持不变) =================
+# ================= 基础组件 =================
 class FourierFeatures(nn.Module):
     def __init__(self, in_dim, num_freqs):
         super().__init__()
@@ -22,7 +22,7 @@ class FiLMLayer(nn.Module):
     def __init__(self, latent_dim, feat_dim):
         super().__init__()
         self.fc = nn.Linear(latent_dim, feat_dim * 2)
-        nn.init.zeros_(self.fc.weight);
+        nn.init.zeros_(self.fc.weight)
         nn.init.zeros_(self.fc.bias)
 
     def forward(self, x, z):
@@ -35,9 +35,9 @@ class DualFiLMLayer(nn.Module):
         super().__init__()
         self.fc_g = nn.Linear(z_global_dim, feat_dim * 2)
         self.fc_e = nn.Linear(z_exc_dim, feat_dim * 2)
-        nn.init.zeros_(self.fc_g.weight);
+        nn.init.zeros_(self.fc_g.weight)
         nn.init.zeros_(self.fc_g.bias)
-        nn.init.zeros_(self.fc_e.weight);
+        nn.init.zeros_(self.fc_e.weight)
         nn.init.zeros_(self.fc_e.bias)
 
     def forward(self, x, z_g, z_e):
@@ -46,6 +46,7 @@ class DualFiLMLayer(nn.Module):
         return x * (1.0 + g1 + g2) + (b1 + b2)
 
 
+# ================= 分支网络 (Branch) =================
 class PairEncoder(nn.Module):
     def __init__(self, in_dim=9, hidden=64, out_dim=64):
         super().__init__()
@@ -89,6 +90,7 @@ class ExcitationMapRefiner(nn.Module):
         return F_map, self.global_head(F_map)
 
 
+# ================= 主干网络 (Trunks) =================
 class HeatmapTrunk(nn.Module):
     def __init__(self, c_map=128, c_global=256, c_heat=64, hidden=128, num_freqs=6):
         super().__init__()
@@ -100,6 +102,7 @@ class HeatmapTrunk(nn.Module):
         self.mid1 = nn.Linear(hidden, hidden)
         self.film2 = FiLMLayer(c_global, hidden)
         self.act = nn.GELU()
+
         self.heat_feat_head = nn.Linear(hidden, c_heat)
         self.heat_logits_head = nn.Linear(c_heat, 1)
 
@@ -111,6 +114,7 @@ class HeatmapTrunk(nn.Module):
         heat_feat = self.heat_feat_head(x)
         heat_logits = self.heat_logits_head(heat_feat)
         heat_prob = torch.sigmoid(heat_logits)
+
         return heat_feat, heat_prob, heat_logits
 
 
@@ -137,6 +141,7 @@ class FieldTrunk(nn.Module):
         return self.out(x)
 
 
+# ================= 终极 SCF-DeepONet 主控类 =================
 class SCFDeepONet_V1(nn.Module):
     def __init__(self):
         super().__init__()
@@ -149,12 +154,12 @@ class SCFDeepONet_V1(nn.Module):
         self.register_buffer("max_field_xyz", torch.tensor([130.0, 90.0, 90.0], dtype=torch.float32))
         self.register_buffer("max_surf_xy", torch.tensor(32.0, dtype=torch.float32))
 
-        # 🚀 物理单位修正：必须还原回真正的“米” (m) 来求导
+        # 物理单位修正：米制单位标度 (m)
         self.register_buffer("max_field_xyz_m", torch.tensor([130e-3, 90e-3, 90e-3], dtype=torch.float32))
         self.register_buffer("max_surf_xy_m", torch.tensor(32e-3, dtype=torch.float32))
 
         self.pde_params = {
-            "omega": 2.0 * torch.pi * 100000.0,  # 🚀 修复点：100 kHz
+            "omega": 2.0 * torch.pi * 100000.0,  # 100 kHz 修正
             "mu_0": 4 * torch.pi * 1e-7,
             "mu_r_iron": 100.0,
             "sigma_iron": 1e7,
@@ -164,8 +169,10 @@ class SCFDeepONet_V1(nn.Module):
     def encode_observation(self, v_pair):
         B, num_exc, num_rec, feat_dim = v_pair.shape
         pair_feat = self.pair_encoder(v_pair.reshape(B * num_exc, num_rec, feat_dim))
+
         z_e_all = self.pool(pair_feat)
         z_e_all = z_e_all.view(B, num_exc, -1)
+
         F_map, z_g = self.refiner(z_e_all)
         return {"z_g": z_g, "z_e_all": z_e_all, "F_map": F_map}
 
@@ -186,19 +193,28 @@ class SCFDeepONet_V1(nn.Module):
 
         x_real = coords_3d_field_norm[..., 0] * self.max_field_xyz[0]
         y_real = coords_3d_field_norm[..., 1] * self.max_field_xyz[1]
+
         coords_2d_proj_norm = torch.stack([x_real / self.max_surf_xy, y_real / self.max_surf_xy], dim=-1)
         coords_2d_proj_norm = torch.clamp(coords_2d_proj_norm, -1.0, 1.0)
 
-        # 🚀 截断梯度，防止 grid_sample 二阶导报错
+        # 截断梯度，防止 grid_sample 二阶导报错
         coords_2d_proj_norm = coords_2d_proj_norm.detach()
 
         heat_out = self.query_heatmap(branch_out, coords_2d_proj_norm)
+
         A_delta_norm = self.field_trunk(
-            coords_3d_field_norm, self.sample_Fmap(branch_out["F_map"], coords_2d_proj_norm),
-            heat_out["heat_feat"], heat_out["heat_prob"], branch_out["z_g"], z_e
+            coords_3d_field_norm,
+            self.sample_Fmap(branch_out["F_map"], coords_2d_proj_norm),
+            heat_out["heat_feat"],
+            heat_out["heat_prob"],
+            branch_out["z_g"],
+            z_e
         )
-        return {"heat_feat_xy": heat_out["heat_feat"], "heat_prob_xy": heat_out["heat_prob"],
-                "A_delta_norm": A_delta_norm}
+        return {
+            "heat_feat_xy": heat_out["heat_feat"],
+            "heat_prob_xy": heat_out["heat_prob"],
+            "A_delta_norm": A_delta_norm
+        }
 
     def _compute_soft_mask(self, coords_real_m, label_xywl, defect_h_mm, sharpness=5.0):
         defect_h_m = (defect_h_mm * 1e-3).view(-1, 1, 1)
@@ -226,7 +242,7 @@ class SCFDeepONet_V1(nn.Module):
         dAy_dxnorm = torch.autograd.grad(Ay, x_norm, torch.ones_like(Ay), create_graph=True)[0]
         dAz_dxnorm = torch.autograd.grad(Az, x_norm, torch.ones_like(Az), create_graph=True)[0]
 
-        # 🚀 除以米制标度，回归国际单位系
+        # 除以米制标度，回归国际单位系
         scale = self.max_field_xyz_m.view(1, 1, 3)
         dAx_dreal, dAy_dreal, dAz_dreal = dAx_dxnorm / scale, dAy_dxnorm / scale, dAz_dxnorm / scale
 
@@ -260,13 +276,36 @@ class SCFDeepONet_V1(nn.Module):
         curl_nu_curl_Ar, _ = self._curl(nu * curl_Ar, coords_pde_norm)
         curl_nu_curl_Ai, _ = self._curl(nu * curl_Ai, coords_pde_norm)
 
-        # 🚀 A计划：保持原始 SI 残差（不引入相对归一化）
-        R_r = curl_nu_curl_Ar - omega * sigma * Ai
-        R_i = curl_nu_curl_Ai + omega * sigma * Ar
-        loss_pde = torch.mean(R_r ** 2 + R_i ** 2)
+        # ====================================================================
+        # 🚀 专家方案 Plan B：Relative Residual (无量纲/相对残差)
+        # ====================================================================
+        term_r_1 = curl_nu_curl_Ar
+        term_r_2 = omega * sigma * Ai
+        term_i_1 = curl_nu_curl_Ai
+        term_i_2 = omega * sigma * Ar
 
+        # 计算原始 SI 残差
+        R_r = term_r_1 - term_r_2
+        R_i = term_i_1 + term_i_2
+
+        # 计算动态无量纲缩放因子 (detach 切断梯度)
+        eps = 1e-12
+        scale_r = term_r_1.detach().pow(2).mean().sqrt() + term_r_2.detach().pow(2).mean().sqrt() + eps
+        scale_i = term_i_1.detach().pow(2).mean().sqrt() + term_i_2.detach().pow(2).mean().sqrt() + eps
+
+        # 计算相对残差
+        R_r_rel = R_r / scale_r
+        R_i_rel = R_i / scale_i
+
+        loss_pde = torch.mean(R_r_rel ** 2 + R_i_rel ** 2)
+
+        # 散度惩罚
         div_Ar = J_Ar[0][..., 0:1] + J_Ar[1][..., 1:2] + J_Ar[2][..., 2:3]
         div_Ai = J_Ai[0][..., 0:1] + J_Ai[1][..., 1:2] + J_Ai[2][..., 2:3]
         loss_div = torch.mean(div_Ar ** 2 + div_Ai ** 2)
 
-        return loss_pde, loss_div
+        # 诊断指标：Raw RMS 和 Rel RMS
+        raw_res_rms = torch.sqrt(torch.mean(R_r.detach() ** 2 + R_i.detach() ** 2)).item()
+        rel_res_rms = torch.sqrt(loss_pde.detach()).item()
+
+        return loss_pde, loss_div, raw_res_rms, rel_res_rms

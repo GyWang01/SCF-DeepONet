@@ -79,7 +79,7 @@ def freeze_all_for_stage3(model):
 
 def freeze_for_stage4_pde(model):
     """
-    🚀 专家止血方案 A1: 绝对死锁！
+    🚀 专家止血方案：绝对死锁！
     彻底锁死前端特征编码器和热图网络，只允许 3D field trunk 被物理梯度洗礼。
     """
     for p in model.parameters():
@@ -92,6 +92,7 @@ def train_epoch(model, dataloader, optimizer, scaler, heat_loss_fn, mse_loss_fn,
                 epochs_stage1, A_scale, is_stage3=False):
     model.train()
     total_heat_loss, total_A_loss, total_pde_loss = 0.0, 0.0, 0.0
+    epoch_raw_rms, epoch_rel_rms = 0.0, 0.0
 
     dataloader.dataset.set_epoch(epoch)
 
@@ -130,17 +131,21 @@ def train_epoch(model, dataloader, optimizer, scaler, heat_loss_fn, mse_loss_fn,
             branch_out_fp32 = {k: v.float() for k, v in branch_out.items()}
 
             with autocast('cuda', enabled=False):
-                loss_pde_val, loss_div_val = model.compute_pde_loss(
+                # 接收修改后的 4 个返回值
+                loss_pde_val, loss_div_val, raw_rms, rel_rms = model.compute_pde_loss(
                     branch_out_fp32, coords_pde.float(), A0_pde.float(),
                     excite_idx, label_norm.float(), defect_h.float(), A_scale.float()
                 )
 
-            # 🚀 专家止血方案 A2: 将原始 SI 残差的权重压至极小，实现和平共处
-            lambda_pde = 1e-12
-            lambda_div = 1e-8
+            # 🚀 专家 Plan B 推荐参数：
+            lambda_pde = 1e-4
+            lambda_div = 0.0
 
             loss = (1.0 / 16.0) * loss_heat + weight_A * loss_A + lambda_pde * loss_pde_val + lambda_div * loss_div_val
+
             total_pde_loss += loss_pde_val.item()
+            epoch_raw_rms += raw_rms
+            epoch_rel_rms += rel_rms
 
         if mode in ["joint", "pde"]:
             total_A_loss += loss_A.item()
@@ -156,7 +161,11 @@ def train_epoch(model, dataloader, optimizer, scaler, heat_loss_fn, mse_loss_fn,
     num_batches = len(dataloader)
     avg_pde = total_pde_loss / num_batches if mode == "pde" else 0.0
     avg_A = total_A_loss / num_batches if mode in ["joint", "pde"] else 0.0
-    return total_heat_loss / num_batches, avg_A, avg_pde
+
+    # 组装诊断指标
+    diags = (epoch_raw_rms / num_batches, epoch_rel_rms / num_batches) if mode == "pde" else None
+
+    return total_heat_loss / num_batches, avg_A, avg_pde, diags
 
 
 @torch.no_grad()
@@ -212,7 +221,7 @@ def validate(model, dataloader, heat_loss_fn, mse_loss_fn, mode, device, val_gri
 
 def get_dataloaders(h5_path, train_ids, val_ids, mode, batch_size, p2_train, p3_train, p2_val, p3_val, excite_train,
                     excite_val):
-    # 🚀 专家止血方案 A4: 将 PDE 配点数降至 256
+    # 🚀 专家保守方案：将 PDE 配点数降至 256
     num_pde = 256 if mode == "pde" else 0
 
     n_workers = 0 if mode == "pde" else 4
@@ -236,11 +245,11 @@ def get_dataloaders(h5_path, train_ids, val_ids, mode, batch_size, p2_train, p3_
 
 
 def main():
-    print("🚀 启动 SCF-DeepONet 究极性能版训练引擎 (PDE Plan A 止血版)...")
+    print("🚀 启动 SCF-DeepONet 究极性能版训练引擎 (PDE Plan B: Relative Residual)...")
     seed_everything(42)
 
     ckpt_dir, splits_dir = "checkpoints", "splits"
-    os.makedirs(ckpt_dir, exist_ok=True);
+    os.makedirs(ckpt_dir, exist_ok=True)
     os.makedirs(splits_dir, exist_ok=True)
 
     device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
@@ -293,6 +302,7 @@ def main():
     last_va_A, last_va_rmse = 0.0, 0.0
 
     print("\n================ 开始四阶段课表训练 (Curriculum Training w/ PDE) ================")
+    # 💡 快捷跳转到 Stage 4
     START_EPOCH = 106
 
     for epoch in range(START_EPOCH, total_epochs + 1):
@@ -336,7 +346,7 @@ def main():
                                                        excite_val=excite_val_s1)
 
         if epoch == epochs_stage1 + epochs_stage2 + epochs_stage3 + 1:
-            print("\n⚛️ 数据-物理双驱动！进入 Stage 4: PDE Plan A 止血版 ⚛️")
+            print("\n⚛️ 数据-物理双驱动！进入 Stage 4: PDE Plan B (Relative Residual) ⚛️")
             best_rmse_ckpt = os.path.join(ckpt_dir, "best_stage2_rmse.pth")
             if os.path.exists(best_rmse_ckpt):
                 model.load_state_dict(torch.load(best_rmse_ckpt, map_location=device)['model_state_dict'], strict=False)
@@ -345,7 +355,7 @@ def main():
             freeze_for_stage4_pde(model)
             trainable_params = [p for p in model.parameters() if p.requires_grad]
 
-            # 🚀 专家止血方案 A3: 学习率降档至 1e-5
+            # 🚀 专家保守方案：学习率降档至 1e-5
             optimizer = optim.AdamW(trainable_params, lr=1e-5, weight_decay=1e-5)
             scheduler = optim.lr_scheduler.ReduceLROnPlateau(optimizer, mode='min', factor=0.5, patience=4)
 
@@ -355,7 +365,8 @@ def main():
                                                        p3_val=p3_val_s2, excite_train=excite_train_s2,
                                                        excite_val=excite_val_s2)
 
-        tr_heat, tr_A, tr_pde = train_epoch(
+        # 接收额外的诊断信息
+        tr_heat, tr_A, tr_pde, diags = train_epoch(
             model, train_loader, optimizer, scaler, heat_loss_fn, mse_loss_fn,
             mode, device, amp_enabled, epoch, epochs_stage1, A_scale_val, is_stage3
         )
@@ -378,7 +389,9 @@ def main():
         print(
             f"Epoch [{epoch:03d}/{total_epochs:03d}] | {stage_name} ({mode.upper()}) | LR: {current_lr:.2e} | Time: {epoch_time:.1f}s")
         print(f"  [Train] Heat: {tr_heat:.4f} | A_MSE: {tr_A:.4e}" + (
-            f" | PDE(Raw SI): {tr_pde:.4e}" if mode == "pde" else ""))
+            f" | PDE(Rel): {tr_pde:.4f}" if mode == "pde" else ""))
+        if mode == "pde" and diags is not None:
+            print(f"          > Diags: Raw RMS = {diags[0]:.2e} | Rel RMS = {diags[1]:.4f}")
         print(f"  [Val]   Heat: {va_heat:.4f} | IoU: {va_iou * 100:05.2f}%")
         if mode in ["joint", "pde"] and not is_stage3:
             print(f"  [Val]   A_MSE: {last_va_A:.4e}{skip_mark} | A_RMSE: {last_va_rmse:.4e}{skip_mark}")
